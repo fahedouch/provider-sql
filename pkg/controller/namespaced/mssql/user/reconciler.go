@@ -20,13 +20,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 	"github.com/pkg/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	xpcontroller "github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
@@ -34,6 +34,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/password"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
 	namespacedv1alpha1 "github.com/crossplane-contrib/provider-sql/apis/namespaced/mssql/v1alpha1"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/mssql"
@@ -45,6 +46,7 @@ const (
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 
 	errSelectUser             = "cannot select user"
+	errSelectLogin            = "cannot select login %s"
 	errCreateUser             = "cannot create user %s"
 	errCreateLogin            = "cannot create login %s"
 	errDropUser               = "error dropping user %s"
@@ -77,6 +79,12 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 		resource.ManagedKind(namespacedv1alpha1.UserGroupVersionKind),
 		reconcilerOptions...,
 	)
+	if err := mgr.Add(statemetrics.NewMRStateRecorder(
+		mgr.GetClient(), o.Logger, o.MetricOptions.MRStateMetrics,
+		&namespacedv1alpha1.UserList{}, o.MetricOptions.PollStateMetricInterval,
+	)); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		For(&namespacedv1alpha1.User{}).
@@ -143,7 +151,7 @@ func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.User) (ma
 		return managed.ExternalObservation{}, errors.Wrap(err, errSelectUser)
 	}
 
-	mg.SetConditions(xpv1.Available())
+	mg.SetConditions(xpv2.Available())
 
 	_, pwdChanged, err := c.getPassword(ctx, mg)
 	if err != nil {
@@ -168,18 +176,20 @@ func (c *external) Create(ctx context.Context, mg *namespacedv1alpha1.User) (man
 		}
 	}
 
-	loginQuery := fmt.Sprintf("CREATE LOGIN %s WITH PASSWORD=%s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
-	if err := c.loginDB.Exec(ctx, xsql.Query{
-		String: loginQuery,
-	}); err != nil {
-		return managed.ExternalCreation{}, errors.Wrapf(err, errCreateLogin, meta.GetExternalName(mg))
-	}
-
-	userQuery := fmt.Sprintf("CREATE USER %s FOR LOGIN %s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteIdentifier(meta.GetExternalName(mg)))
-	if err := c.userDB.Exec(ctx, xsql.Query{
-		String: userQuery,
-	}); err != nil {
-		return managed.ExternalCreation{}, errors.Wrapf(err, errCreateUser, meta.GetExternalName(mg))
+	// Check if this should be a contained database user
+	if mg.Spec.ForProvider.Contained != nil && *mg.Spec.ForProvider.Contained {
+		// Create contained database user directly without LOGIN
+		dbName := ptr.Deref(mg.Spec.ForProvider.Database, "")
+		userQuery := fmt.Sprintf("USE %s; CREATE USER %s WITH PASSWORD = %s", mssql.QuoteIdentifier(dbName), mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
+		if err := c.userDB.Exec(ctx, xsql.Query{
+			String: userQuery,
+		}); err != nil {
+			return managed.ExternalCreation{}, errors.Wrapf(err, errCreateUser, meta.GetExternalName(mg))
+		}
+	} else {
+		if err := c.createLoginAndUser(ctx, mg, pw); err != nil {
+			return managed.ExternalCreation{}, err
+		}
 	}
 
 	return managed.ExternalCreation{
@@ -194,11 +204,23 @@ func (c *external) Update(ctx context.Context, mg *namespacedv1alpha1.User) (man
 	}
 
 	if changed {
-		query := fmt.Sprintf("ALTER LOGIN %s WITH PASSWORD=%s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
-		if err := c.loginDB.Exec(ctx, xsql.Query{
-			String: query,
-		}); err != nil {
-			return managed.ExternalUpdate{}, errors.Wrap(err, errUpdateUser)
+		if mg.Spec.ForProvider.Contained != nil && *mg.Spec.ForProvider.Contained {
+			// For contained users, use ALTER USER syntax with explicit USE statement
+			dbName := ptr.Deref(mg.Spec.ForProvider.Database, "")
+			query := fmt.Sprintf("USE %s; ALTER USER %s WITH PASSWORD = %s", mssql.QuoteIdentifier(dbName), mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
+			if err := c.userDB.Exec(ctx, xsql.Query{
+				String: query,
+			}); err != nil {
+				return managed.ExternalUpdate{}, errors.Wrap(err, errUpdateUser)
+			}
+		} else {
+			// For traditional users, use ALTER LOGIN syntax
+			query := fmt.Sprintf("ALTER LOGIN %s WITH PASSWORD=%s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
+			if err := c.loginDB.Exec(ctx, xsql.Query{
+				String: query,
+			}); err != nil {
+				return managed.ExternalUpdate{}, errors.Wrap(err, errUpdateUser)
+			}
 		}
 
 		return managed.ExternalUpdate{
@@ -212,25 +234,78 @@ func (c *external) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-func (c *external) Delete(ctx context.Context, mg *namespacedv1alpha1.User) (managed.ExternalDelete, error) {
-	query := fmt.Sprintf("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = %s", mssql.QuoteValue(meta.GetExternalName(mg)))
+// createLoginAndUser creates the traditional server-level LOGIN plus the
+// database USER mapped to it. The LOGIN is a server-level object shared by all
+// databases, so a single login can back USERs in multiple databases. It is
+// only created when it does not already exist, so a second User for the same
+// login (in a different database) does not fail with "server principal already
+// exists" and retries after a partial failure are idempotent.
+func (c *external) createLoginAndUser(ctx context.Context, mg *namespacedv1alpha1.User, pw string) error {
+	exists, err := c.loginExists(ctx, meta.GetExternalName(mg))
+	if err != nil {
+		return errors.Wrapf(err, errSelectLogin, meta.GetExternalName(mg))
+	}
+	if !exists {
+		loginQuery := fmt.Sprintf("CREATE LOGIN %s WITH PASSWORD=%s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteValue(pw))
+		if err := c.loginDB.Exec(ctx, xsql.Query{
+			String: loginQuery,
+		}); err != nil {
+			return errors.Wrapf(err, errCreateLogin, meta.GetExternalName(mg))
+		}
+	}
+
+	userQuery := fmt.Sprintf("CREATE USER %s FOR LOGIN %s", mssql.QuoteIdentifier(meta.GetExternalName(mg)), mssql.QuoteIdentifier(meta.GetExternalName(mg)))
+	if err := c.userDB.Exec(ctx, xsql.Query{
+		String: userQuery,
+	}); err != nil {
+		return errors.Wrapf(err, errCreateUser, meta.GetExternalName(mg))
+	}
+	return nil
+}
+
+// loginExists reports whether a server-level SQL login with the given name
+// already exists, queried against loginDB (the login database, normally
+// master). It lets Create and Delete treat the shared login idempotently.
+func (c *external) loginExists(ctx context.Context, name string) (bool, error) {
+	var got string
+	err := c.loginDB.Scan(ctx, xsql.Query{
+		String:     "SELECT name FROM sys.sql_logins WHERE name = @p1",
+		Parameters: []interface{}{name},
+	}, &got)
+	if xsql.IsNoRows(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (c *external) killLoginSessions(ctx context.Context, loginName string) error {
+	query := fmt.Sprintf("SELECT session_id FROM sys.dm_exec_sessions WHERE login_name = %s", mssql.QuoteValue(loginName))
 	rows, err := c.userDB.Query(ctx, xsql.Query{String: query})
 	if err != nil {
-		return managed.ExternalDelete{}, errors.Wrap(err, errCannotGetLogins)
+		return errors.Wrap(err, errCannotGetLogins)
 	}
 	defer rows.Close() //nolint:errcheck
 
 	for rows.Next() {
 		var sessionID int
 		if err := rows.Scan(&sessionID); err != nil {
-			return managed.ExternalDelete{}, errors.Wrap(err, errCannotGetLogins)
+			return errors.Wrap(err, errCannotGetLogins)
 		}
 		if err := c.userDB.Exec(ctx, xsql.Query{String: fmt.Sprintf("KILL %d", sessionID)}); err != nil {
-			return managed.ExternalDelete{}, errors.Wrapf(err, errCannotKillLoginSession, sessionID, meta.GetExternalName(mg))
+			return errors.Wrapf(err, errCannotKillLoginSession, sessionID, loginName)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return managed.ExternalDelete{}, errors.Wrap(err, errCannotGetLogins)
+	return rows.Err()
+}
+
+func (c *external) Delete(ctx context.Context, mg *namespacedv1alpha1.User) (managed.ExternalDelete, error) {
+	isContained := mg.Spec.ForProvider.Contained != nil && *mg.Spec.ForProvider.Contained
+
+	// Only kill sessions for traditional users with logins, not contained users
+	if !isContained {
+		if err := c.killLoginSessions(ctx, meta.GetExternalName(mg)); err != nil {
+			return managed.ExternalDelete{}, err
+		}
 	}
 
 	if err := c.userDB.Exec(ctx, xsql.Query{
@@ -239,10 +314,21 @@ func (c *external) Delete(ctx context.Context, mg *namespacedv1alpha1.User) (man
 		return managed.ExternalDelete{}, errors.Wrapf(err, errDropUser, meta.GetExternalName(mg))
 	}
 
-	if err := c.loginDB.Exec(ctx, xsql.Query{
-		String: fmt.Sprintf("DROP LOGIN %s", mssql.QuoteIdentifier(meta.GetExternalName(mg))),
-	}); err != nil {
-		return managed.ExternalDelete{}, errors.Wrapf(err, errDropLogin, meta.GetExternalName(mg))
+	// Only drop LOGIN if this is not a contained user, and only when it still
+	// exists. A shared login may already have been dropped by a sibling User
+	// (or orphaned on purpose), so guard the DROP to keep Delete idempotent.
+	if !isContained {
+		exists, err := c.loginExists(ctx, meta.GetExternalName(mg))
+		if err != nil {
+			return managed.ExternalDelete{}, errors.Wrapf(err, errSelectLogin, meta.GetExternalName(mg))
+		}
+		if exists {
+			if err := c.loginDB.Exec(ctx, xsql.Query{
+				String: fmt.Sprintf("DROP LOGIN %s", mssql.QuoteIdentifier(meta.GetExternalName(mg))),
+			}); err != nil {
+				return managed.ExternalDelete{}, errors.Wrapf(err, errDropLogin, meta.GetExternalName(mg))
+			}
+		}
 	}
 
 	return managed.ExternalDelete{}, nil

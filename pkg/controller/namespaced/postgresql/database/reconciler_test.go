@@ -28,11 +28,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/crossplane/crossplane-runtime/v2/apis/common"
-	xpv2 "github.com/crossplane/crossplane-runtime/v2/apis/common/v2"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/test"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/xsql"
 	provErrors "github.com/crossplane-contrib/provider-sql/pkg/controller/namespaced/errors"
@@ -43,6 +42,7 @@ type mockDB struct {
 	MockExecTx               func(ctx context.Context, ql []xsql.Query) error
 	MockScan                 func(ctx context.Context, q xsql.Query, dest ...interface{}) error
 	MockGetConnectionDetails func(username, password string) managed.ConnectionDetails
+	MockGetServerVersion     func(ctx context.Context) (int, error)
 }
 
 func (m mockDB) Exec(ctx context.Context, q xsql.Query) error {
@@ -59,6 +59,17 @@ func (m mockDB) Query(ctx context.Context, q xsql.Query) (*sql.Rows, error) {
 }
 func (m mockDB) GetConnectionDetails(username, password string) managed.ConnectionDetails {
 	return m.MockGetConnectionDetails(username, password)
+}
+
+func (m mockDB) GetServerVersion(ctx context.Context) (int, error) {
+	if m.MockGetServerVersion == nil {
+		return 0, nil
+	}
+	return m.MockGetServerVersion(ctx)
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 func TestConnect(t *testing.T) {
@@ -100,7 +111,7 @@ func TestConnect(t *testing.T) {
 				mg: &v1alpha1.Database{
 					Spec: v1alpha1.DatabaseSpec{
 						ManagedResourceSpec: xpv2.ManagedResourceSpec{
-							ProviderConfigReference: &common.ProviderConfigReference{Kind: "Invalid"},
+							ProviderConfigReference: &xpv2.ProviderConfigReference{Kind: "Invalid"},
 						},
 					},
 				},
@@ -122,7 +133,7 @@ func TestConnect(t *testing.T) {
 					},
 					Spec: v1alpha1.DatabaseSpec{
 						ManagedResourceSpec: xpv2.ManagedResourceSpec{
-							ProviderConfigReference: &common.ProviderConfigReference{
+							ProviderConfigReference: &xpv2.ProviderConfigReference{
 								Kind: v1alpha1.ProviderConfigKind,
 								Name: "example",
 							},
@@ -144,7 +155,7 @@ func TestConnect(t *testing.T) {
 				mg: &v1alpha1.Database{
 					Spec: v1alpha1.DatabaseSpec{
 						ManagedResourceSpec: xpv2.ManagedResourceSpec{
-							ProviderConfigReference: &common.ProviderConfigReference{
+							ProviderConfigReference: &xpv2.ProviderConfigReference{
 								Kind: v1alpha1.ClusterProviderConfigKind,
 								Name: "example",
 							},
@@ -172,7 +183,7 @@ func TestConnect(t *testing.T) {
 					},
 					Spec: v1alpha1.DatabaseSpec{
 						ManagedResourceSpec: xpv2.ManagedResourceSpec{
-							ProviderConfigReference: &common.ProviderConfigReference{
+							ProviderConfigReference: &xpv2.ProviderConfigReference{
 								Kind: v1alpha1.ProviderConfigKind,
 								Name: "example",
 							},
@@ -189,7 +200,7 @@ func TestConnect(t *testing.T) {
 					MockGet: test.NewMockGetFn(nil, func(obj client.Object) error {
 						switch o := obj.(type) {
 						case *v1alpha1.ProviderConfig:
-							o.Spec.Credentials.ConnectionSecretRef = common.LocalSecretReference{Name: "example"}
+							o.Spec.Credentials.ConnectionSecretRef = xpv2.LocalSecretReference{Name: "example"}
 						case *corev1.Secret:
 							return errBoom
 						}
@@ -205,7 +216,7 @@ func TestConnect(t *testing.T) {
 					},
 					Spec: v1alpha1.DatabaseSpec{
 						ManagedResourceSpec: xpv2.ManagedResourceSpec{
-							ProviderConfigReference: &common.ProviderConfigReference{
+							ProviderConfigReference: &xpv2.ProviderConfigReference{
 								Kind: v1alpha1.ProviderConfigKind,
 								Name: "example",
 							},
@@ -327,8 +338,9 @@ func TestCreate(t *testing.T) {
 	}
 
 	type want struct {
-		c   managed.ExternalCreation
-		err error
+		c     managed.ExternalCreation
+		err   error
+		query string
 	}
 
 	cases := map[string]struct {
@@ -379,10 +391,69 @@ func TestCreate(t *testing.T) {
 				err: nil,
 			},
 		},
+		"SuccessWithStrategy": {
+			reason: "The CREATE statement should include STRATEGY when specified",
+			fields: fields{
+				db: &mockDB{
+					MockExec: func(ctx context.Context, q xsql.Query) error { return nil },
+					MockScan: func(ctx context.Context, q xsql.Query, dest ...interface{}) error {
+						*(dest[0].(*int)) = minDatabaseStrategyServerVersion
+						return nil
+					},
+				},
+			},
+			args: args{
+				mg: &v1alpha1.Database{
+					Spec: v1alpha1.DatabaseSpec{
+						ForProvider: v1alpha1.DatabaseParameters{
+							Template: ptr("template-source"),
+							Strategy: ptr(v1alpha1.DatabaseStrategyFileCopy),
+						},
+					},
+				},
+			},
+			want: want{
+				err:   nil,
+				query: `CREATE DATABASE "" TEMPLATE "template-source" STRATEGY FILE_COPY`,
+			},
+		},
+		"ErrUnsupportedStrategyVersion": {
+			reason: "An error should be returned when strategy is requested on PostgreSQL versions older than 15",
+			fields: fields{
+				db: &mockDB{
+					MockExec: func(ctx context.Context, q xsql.Query) error { return nil },
+					MockScan: func(ctx context.Context, q xsql.Query, dest ...interface{}) error {
+						*(dest[0].(*int)) = 140000
+						return nil
+					},
+				},
+			},
+			args: args{
+				mg: &v1alpha1.Database{
+					Spec: v1alpha1.DatabaseSpec{
+						ForProvider: v1alpha1.DatabaseParameters{
+							Strategy: ptr(v1alpha1.DatabaseStrategyFileCopy),
+						},
+					},
+				},
+			},
+			want: want{
+				err: errors.Wrap(errors.Errorf("database strategy requires PostgreSQL 15+; found server_version_num=%d", 140000), errCreateDB),
+			},
+		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			var lastQuery string
+			if tc.want.query != "" {
+				origDB := tc.fields.db.(*mockDB)
+				origExec := origDB.MockExec
+				origDB.MockExec = func(ctx context.Context, q xsql.Query) error {
+					lastQuery = q.String
+					return origExec(ctx, q)
+				}
+			}
 			e := external{db: tc.fields.db}
 			got, err := e.Create(tc.args.ctx, tc.args.mg)
 			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
@@ -390,6 +461,11 @@ func TestCreate(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.c, got); diff != "" {
 				t.Errorf("\n%s\ne.Create(...): -want, +got:\n%s\n", tc.reason, diff)
+			}
+			if tc.want.query != "" {
+				if diff := cmp.Diff(tc.want.query, lastQuery); diff != "" {
+					t.Errorf("\n%s\ne.Create(...): -want query, +got query:\n%s\n", tc.reason, diff)
+				}
 			}
 		})
 	}

@@ -21,20 +21,23 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	xpcontroller "github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/reference"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
-	namespacedv1alpha1 "github.com/crossplane-contrib/provider-sql/apis/namespaced/postgresql/v1alpha1"
+	"github.com/crossplane-contrib/provider-sql/apis/namespaced/postgresql/v1alpha1"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/postgresql"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/xsql"
@@ -44,58 +47,60 @@ import (
 const (
 	errTrackPCUsage = "cannot track ProviderConfig usage"
 
+	errNotGrant     = "managed resource is not a Grant custom resource"
 	errSelectGrant  = "cannot select grant"
 	errCreateGrant  = "cannot create grant"
 	errRevokeGrant  = "cannot revoke grant"
 	errNoRole       = "role not passed or could not be resolved"
-	errNoDatabase   = "database not passed or could not be resolved"
-	errNoPrivileges = "privileges not passed"
 	errUnknownGrant = "cannot identify grant type based on passed params"
 
-	errInvalidParams = "invalid parameters for grant type %s"
-
+	errUnsupportedGrant                 = "grant type not supported: %s"
+	errInvalidParams                    = "invalid parameters for grant type %s"
 	errMemberOfWithDatabaseOrPrivileges = "cannot set privileges or database in the same grant as memberOf"
+	errWithInheritOnlyForMemberOf       = "withInherit is only valid for memberOf grants"
+	errInheritRequiresPG16              = "withInherit requires PostgreSQL 16 or later (server version %d)"
+
+	// Every relkind GRANT ... ON TABLE stores an ACL on. Filtering to 'r'
+	// alone made grants on the rest Create and then never observe.
+	relkindTable = "IN ('r', 'p', 'v', 'm', 'f')"
+	// Deliberately narrower; must not be widened with relkindTable.
+	relkindSequence = "= 'S'"
 
 	maxConcurrency = 5
+
+	// versionUnknown is the serverVersion sentinel used when the backend cannot
+	// report server_version_num. It means "assume the newest behaviour":
+	// ExpandPrivilegesWithVersion already treats 0 as "include every privilege".
+	// Version-gated features must therefore not treat it as an old server.
+	versionUnknown = 0
 )
-
-// Setup adds a controller that reconciles Database managed resources.
-func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
-	name := managed.ControllerName(namespacedv1alpha1.GrantGroupKind)
-
-	t := resource.NewProviderConfigUsageTracker(mgr.GetClient(), &namespacedv1alpha1.ProviderConfigUsage{})
-
-	reconcilerOptions := []managed.ReconcilerOption{
-		managed.WithTypedExternalConnector(&connector{kube: mgr.GetClient(), track: t.Track, newDB: postgresql.New}),
-		managed.WithLogger(o.Logger.WithValues("controller", name)),
-		managed.WithPollInterval(o.PollInterval),
-		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
-	}
-	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
-		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
-	}
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(namespacedv1alpha1.GrantGroupVersionKind),
-		reconcilerOptions...,
-	)
-	return ctrl.NewControllerManagedBy(mgr).
-		Named(name).
-		For(&namespacedv1alpha1.Grant{}).
-		WithOptions(controller.Options{
-			MaxConcurrentReconciles: maxConcurrency,
-		}).
-		Complete(r)
-}
 
 type connector struct {
 	kube  client.Client
+	log   logging.Logger
 	track func(ctx context.Context, mg resource.ModernManaged) error
 	newDB func(creds map[string][]byte, database string, sslmode string) xsql.DB
 }
 
-var _ managed.TypedExternalConnector[*namespacedv1alpha1.Grant] = &connector{}
+type external struct {
+	db            xsql.DB
+	kube          client.Client
+	serverVersion int
+}
 
-func (c *connector) Connect(ctx context.Context, mg *namespacedv1alpha1.Grant) (managed.TypedExternalClient[*namespacedv1alpha1.Grant], error) {
+var _ managed.TypedExternalConnector[*v1alpha1.Grant] = &connector{}
+var _ managed.TypedExternalClient[*v1alpha1.Grant] = &external{}
+
+// columnsPrivileges returns the privileges for columns in grant format
+func columnsPrivileges(priv []string, cols string) string {
+	ret := make([]string, len(priv))
+	for i, v := range priv {
+		ret[i] = v + "(" + cols + ")"
+	}
+	return strings.Join(ret, ",")
+}
+
+func (c *connector) Connect(ctx context.Context, mg *v1alpha1.Grant) (managed.TypedExternalClient[*v1alpha1.Grant], error) {
 	if err := c.track(ctx, mg); err != nil {
 		return nil, errors.Wrap(err, errTrackPCUsage)
 	}
@@ -107,120 +112,368 @@ func (c *connector) Connect(ctx context.Context, mg *namespacedv1alpha1.Grant) (
 		return nil, err
 	}
 
+	xdb := c.newDB(providerInfo.SecretData, connectDatabase(mg.Spec.ForProvider, providerInfo.DefaultDatabase), clients.ToString(providerInfo.SSLMode))
+
+	// A server that cannot report its version is not a reason to fail: only
+	// table grants are version dependent, and ExpandPrivilegesWithVersion
+	// treats 0 as "latest", which is what this provider assumed before the
+	// version check existed. Failing here would gate Observe, Create *and*
+	// Delete, wedging the finalizer behind a connection proxy that does not
+	// expose server_version_num.
+	serverVersion, err := xdb.GetServerVersion(ctx)
+	if err != nil {
+		c.log.Debug("cannot determine server version, assuming latest", "error", err)
+		serverVersion = versionUnknown
+	}
+
 	return &external{
-		db:   c.newDB(providerInfo.SecretData, providerInfo.DefaultDatabase, clients.ToString(providerInfo.SSLMode)),
-		kube: c.kube,
+		db:            xdb,
+		kube:          c.kube,
+		serverVersion: serverVersion,
 	}, nil
 }
 
-type external struct {
-	db   xsql.DB
-	kube client.Client
-}
+// connectDatabase returns the database the provider should open a session
+// against for the given grant.
+//
+// Grants on objects *inside* a database (schemas, tables, columns, sequences,
+// routines, foreign data wrappers, foreign servers) must be applied and
+// observed from a session on that database, because their catalogs are
+// database local.
+//
+// Database-level grants and role membership are cluster wide: GRANT ... ON
+// DATABASE x and the pg_database / pg_auth_members lookups all work from any
+// session. Connecting to the grant's target for those would impose a needless
+// ordering dependency (the database must already exist and be connectable) and
+// can lock the provider out of the very database it must reconnect to, e.g.
+// after `revokePublicOnDb: true` removes PUBLIC's CONNECT privilege.
+func connectDatabase(gp v1alpha1.GrantParameters, defaultDatabase string) string {
+	gt, err := resolveGrantType(gp)
+	if err != nil {
+		// Not resolvable yet (unresolved refs). Observe will surface the error;
+		// use the default database so we can at least connect.
+		return defaultDatabase
+	}
 
-var _ managed.TypedExternalClient[*namespacedv1alpha1.Grant] = &external{}
-
-type grantType string
-
-const (
-	roleMember   grantType = "ROLE_MEMBER"
-	roleDatabase grantType = "ROLE_DATABASE"
-)
-
-func identifyGrantType(gp namespacedv1alpha1.GrantParameters) (grantType, error) {
-	pc := len(gp.Privileges)
-
-	// If memberOf is specified, this is ROLE_MEMBER
-	// NOTE: If any of these are set, even if the lookup by ref or selector fails,
-	// then this is still a roleMember grant type.
-	if gp.MemberOfRef != nil || gp.MemberOfSelector != nil || gp.MemberOf != nil {
-		if gp.Database != nil || pc > 0 {
-			return "", errors.New(errMemberOfWithDatabaseOrPrivileges)
+	switch gt {
+	case v1alpha1.RoleDatabase, v1alpha1.RoleMember:
+		return defaultDatabase
+	case v1alpha1.RoleSchema, v1alpha1.RoleTable, v1alpha1.RoleColumn,
+		v1alpha1.RoleSequence, v1alpha1.RoleRoutine,
+		v1alpha1.RoleForeignDataWrapper, v1alpha1.RoleForeignServer:
+		if db := reference.FromPtrValue(gp.Database); db != "" {
+			return db
 		}
-		return roleMember, nil
 	}
 
-	if gp.Database == nil {
-		return "", errors.New(errNoDatabase)
-	}
-
-	if pc < 1 {
-		return "", errors.New(errNoPrivileges)
-	}
-
-	// This is ROLE_DATABASE
-	return roleDatabase, nil
+	return defaultDatabase
 }
 
-func selectGrantQuery(gp namespacedv1alpha1.GrantParameters, q *xsql.Query) error {
-	gt, err := identifyGrantType(gp)
+func (c *external) Create(ctx context.Context, mg *v1alpha1.Grant) (managed.ExternalCreation, error) {
+	if mg == nil {
+		return managed.ExternalCreation{}, errors.New(errNotGrant)
+	}
+
+	var queries []xsql.Query
+
+	mg.SetConditions(xpv2.Creating())
+
+	if err := createGrantQueriesWithVersion(mg.Spec.ForProvider, &queries, c.serverVersion); err != nil {
+		return managed.ExternalCreation{}, errors.Wrap(err, errCreateGrant)
+	}
+
+	return managed.ExternalCreation{}, errors.Wrap(c.db.ExecTx(ctx, queries), errCreateGrant)
+}
+
+func createColumnGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || gp.Schema == nil || len(gp.Tables) < 1 || len(gp.Columns) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleColumn)
+	}
+
+	co := strings.Join(quoteIdentifiers(gp.Columns), ",")
+	cp := columnsPrivileges(gp.Privileges.ToStringSlice(), co)
+	tb := strings.Join(prefixAndQuote(*gp.Schema, gp.Tables), ",")
+
+	*ql = append(*ql,
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON TABLE %s FROM %s", cp, tb, ro)},
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON TABLE %s TO %s %s", cp, tb, ro, withOption(gp.WithOption))},
+	)
+	return nil
+}
+
+func createDatabaseGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleDatabase)
+	}
+
+	db := pq.QuoteIdentifier(*gp.Database)
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON DATABASE %s FROM %s", sp, db, ro)},
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON DATABASE %s TO %s %s", sp, db, ro, withOption(gp.WithOption))},
+	)
+	if gp.RevokePublicOnDb != nil && *gp.RevokePublicOnDb {
+		*ql = append(*ql, xsql.Query{String: fmt.Sprintf("REVOKE ALL ON DATABASE %s FROM PUBLIC", db)})
+	}
+	return nil
+}
+
+func createForeignDataWrapperGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || len(gp.ForeignDataWrappers) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleForeignDataWrapper)
+	}
+
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON FOREIGN DATA WRAPPER %s FROM %s",
+			sp,
+			strings.Join(quoteIdentifiers(gp.ForeignDataWrappers), ","),
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON FOREIGN DATA WRAPPER %s TO %s %s",
+			sp,
+			strings.Join(quoteIdentifiers(gp.ForeignDataWrappers), ","),
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func createForeignServerGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || len(gp.ForeignServers) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleForeignServer)
+	}
+
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON FOREIGN SERVER %s FROM %s",
+			sp,
+			strings.Join(quoteIdentifiers(gp.ForeignServers), ","),
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON FOREIGN SERVER %s TO %s %s",
+			sp,
+			strings.Join(quoteIdentifiers(gp.ForeignServers), ","),
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func createGrantQueriesWithVersion(gp v1alpha1.GrantParameters, ql *[]xsql.Query, serverVersion int) error { //nolint: gocyclo
+	gt, err := resolveGrantType(gp)
 	if err != nil {
 		return err
 	}
 
+	ro := pq.QuoteIdentifier(*gp.Role)
+
 	switch gt {
-	case roleMember:
-		ao := gp.WithOption != nil && *gp.WithOption == namespacedv1alpha1.GrantOptionAdmin
-
-		// Always returns a row with a true or false value
-		// A simpler query would use ::regrol to cast the
-		// roleid and member oids to their role names, but
-		// if this is used with a nonexistent role name it will
-		// throw an error rather than return false.
-		q.String = "SELECT EXISTS(SELECT 1 FROM pg_auth_members m " +
-			"INNER JOIN pg_roles mo ON m.roleid = mo.oid " +
-			"INNER JOIN pg_roles r ON m.member = r.oid " +
-			"WHERE r.rolname=$1 AND mo.rolname=$2 AND " +
-			"m.admin_option = $3)"
-
-		q.Parameters = []interface{}{
-			gp.Role,
-			gp.MemberOf,
-			ao,
+	case v1alpha1.RoleColumn:
+		return createColumnGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleDatabase:
+		return createDatabaseGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleForeignDataWrapper:
+		return createForeignDataWrapperGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleForeignServer:
+		return createForeignServerGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleMember:
+		if gp.WithInherit != nil && serverVersion != versionUnknown && serverVersion < 160000 {
+			return errors.Errorf(errInheritRequiresPG16, serverVersion)
 		}
-		return nil
-	case roleDatabase:
-		gro := gp.WithOption != nil && *gp.WithOption == namespacedv1alpha1.GrantOptionGrant
-
-		ep := gp.Privileges.ExpandPrivileges()
-		sp := ep.ToStringSlice()
-		// Join grantee. Filter by database name and grantee name.
-		// Finally, perform a permission comparison against expected
-		// permissions.
-		q.String = "SELECT EXISTS(SELECT 1 " +
-			"FROM pg_database db, " +
-			"aclexplode(datacl) as acl " +
-			"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
-			// Filter by database, role and grantable setting
-			"WHERE db.datname=$1 " +
-			"AND s.rolname=$2 " +
-			"AND acl.is_grantable=$3 " +
-			"GROUP BY db.datname, s.rolname, acl.is_grantable " +
-			// Check privileges match. Convoluted right-hand-side is necessary to
-			// ensure identical sort order of the input permissions.
-			"HAVING array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
-			"= (SELECT array(SELECT unnest($4::text[]) as perms ORDER BY perms ASC)))"
-
-		q.Parameters = []interface{}{
-			gp.Database,
-			gp.Role,
-			gro,
-			pq.Array(sp),
-		}
-		return nil
+		return createMemberGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleRoutine:
+		return createRoutineGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleSchema:
+		return createSchemaGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleSequence:
+		return createSequenceGrantQueries(gp, ql, ro)
+	case v1alpha1.RoleTable:
+		return createTableGrantQueriesWithVersion(gp, ql, ro, serverVersion)
 	}
-	return errors.New(errUnknownGrant)
+	return errors.Errorf(errUnsupportedGrant, gt)
 }
 
-func withOption(option *namespacedv1alpha1.GrantOption) string {
+func createMemberGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.MemberOf == nil || gp.Role == nil {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleMember)
+	}
+
+	mo := pq.QuoteIdentifier(*gp.MemberOf)
+
+	*ql = append(*ql,
+		xsql.Query{String: fmt.Sprintf("REVOKE %s FROM %s", mo, ro)},
+		xsql.Query{String: fmt.Sprintf("GRANT %s TO %s %s", mo, ro,
+			membershipWithClauses(gp.WithOption, gp.WithInherit),
+		)},
+	)
+	return nil
+}
+
+// membershipWithClauses builds the WITH clause for role membership GRANTs,
+// combining the optional ADMIN/SET option and the optional INHERIT flag.
+// On PostgreSQL 16+, multiple options are comma-separated: WITH ADMIN OPTION, INHERIT FALSE.
+func membershipWithClauses(option *v1alpha1.GrantOption, inherit *bool) string {
+	var parts []string
 	if option != nil {
-		return fmt.Sprintf("WITH %s OPTION", string(*option))
+		parts = append(parts, fmt.Sprintf("%s OPTION", string(*option)))
 	}
-	return ""
+	if inherit != nil {
+		if *inherit {
+			parts = append(parts, "INHERIT TRUE")
+		} else {
+			parts = append(parts, "INHERIT FALSE")
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "WITH " + strings.Join(parts, ", ")
 }
 
-func createGrantQueries(gp namespacedv1alpha1.GrantParameters, ql *[]xsql.Query) error { // nolint: gocyclo
-	gt, err := identifyGrantType(gp)
+func createRoutineGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || gp.Schema == nil || len(gp.Routines) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleRoutine)
+	}
+
+	rt := grantTarget("ROUTINE", "ROUTINES", *gp.Schema,
+		quotedSignatures(*gp.Schema, gp.Routines), v1alpha1.IsWildcardRoutines(gp.Routines))
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(sp, v1alpha1.IsWildcardRoutines(gp.Routines)),
+			rt,
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON %s TO %s %s",
+			sp,
+			rt,
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func createSchemaGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || gp.Schema == nil || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleSchema)
+	}
+
+	sh := pq.QuoteIdentifier(*gp.Schema)
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON SCHEMA %s FROM %s",
+			sp,
+			sh,
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON SCHEMA %s TO %s %s",
+			sp,
+			sh,
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func createSequenceGrantQueries(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string) error {
+	if gp.Database == nil || gp.Schema == nil || len(gp.Sequences) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleSequence)
+	}
+
+	sq := grantTarget("SEQUENCE", "SEQUENCES", *gp.Schema,
+		prefixAndQuote(*gp.Schema, gp.Sequences), v1alpha1.IsWildcard(gp.Sequences))
+	sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(sp, v1alpha1.IsWildcard(gp.Sequences)),
+			sq,
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON %s TO %s %s",
+			sp,
+			sq,
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func createTableGrantQueriesWithVersion(gp v1alpha1.GrantParameters, ql *[]xsql.Query, ro string, serverVersion int) error {
+	if gp.Database == nil || gp.Schema == nil || len(gp.Tables) < 1 || gp.Role == nil || len(gp.Privileges) < 1 {
+		return errors.Errorf(errInvalidParams, v1alpha1.RoleTable)
+	}
+
+	tb := grantTarget("TABLE", "TABLES", *gp.Schema,
+		prefixAndQuote(*gp.Schema, gp.Tables), v1alpha1.IsWildcard(gp.Tables))
+	// Use version-aware privilege expansion
+	expandedPrivileges := gp.ExpandPrivilegesWithVersion(serverVersion)
+	sp := strings.Join(expandedPrivileges.ToStringSlice(), ",")
+
+	*ql = append(*ql,
+		// REVOKE ANY MATCHING EXISTING PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(sp, v1alpha1.IsWildcard(gp.Tables)),
+			tb,
+			ro,
+		)},
+
+		// GRANT REQUESTED PERMISSIONS
+		xsql.Query{String: fmt.Sprintf("GRANT %s ON %s TO %s %s",
+			sp,
+			tb,
+			ro,
+			withOption(gp.WithOption),
+		)},
+	)
+	return nil
+}
+
+func (c *external) Delete(ctx context.Context, mg *v1alpha1.Grant) (managed.ExternalDelete, error) {
+	if mg == nil {
+		return managed.ExternalDelete{}, errors.New(errNotGrant)
+	}
+
+	var query xsql.Query
+
+	mg.SetConditions(xpv2.Deleting())
+
+	err := deleteGrantQuery(mg.Spec.ForProvider, &query)
+	if err != nil {
+		return managed.ExternalDelete{}, errors.Wrap(err, errRevokeGrant)
+	}
+
+	return managed.ExternalDelete{}, errors.Wrap(c.db.Exec(ctx, query), errRevokeGrant)
+}
+
+func deleteGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error { // nolint: gocyclo
+	gt, err := resolveGrantType(gp)
 	if err != nil {
 		return err
 	}
@@ -228,97 +481,108 @@ func createGrantQueries(gp namespacedv1alpha1.GrantParameters, ql *[]xsql.Query)
 	ro := pq.QuoteIdentifier(*gp.Role)
 
 	switch gt {
-	case roleMember:
-		if gp.MemberOf == nil || gp.Role == nil {
-			return errors.Errorf(errInvalidParams, roleMember)
-		}
-
-		mo := pq.QuoteIdentifier(*gp.MemberOf)
-
-		*ql = append(*ql,
-			xsql.Query{String: fmt.Sprintf("REVOKE %s FROM %s", mo, ro)},
-			xsql.Query{String: fmt.Sprintf("GRANT %s TO %s %s", mo, ro,
-				withOption(gp.WithOption),
-			)},
-		)
-		return nil
-	case roleDatabase:
-		if gp.Database == nil || gp.Role == nil || len(gp.Privileges) < 1 {
-			return errors.Errorf(errInvalidParams, roleDatabase)
-		}
-
-		db := pq.QuoteIdentifier(*gp.Database)
-		sp := strings.Join(gp.Privileges.ToStringSlice(), ",")
-
-		*ql = append(*ql,
-			// REVOKE ANY MATCHING EXISTING PERMISSIONS
-			xsql.Query{String: fmt.Sprintf("REVOKE %s ON DATABASE %s FROM %s",
-				sp,
-				db,
-				ro,
-			)},
-
-			// GRANT REQUESTED PERMISSIONS
-			xsql.Query{String: fmt.Sprintf("GRANT %s ON DATABASE %s TO %s %s",
-				sp,
-				db,
-				ro,
-				withOption(gp.WithOption),
-			)},
-		)
-		if gp.RevokePublicOnDb != nil && *gp.RevokePublicOnDb {
-			*ql = append(*ql,
-				// REVOKE FROM PUBLIC
-				xsql.Query{String: fmt.Sprintf("REVOKE ALL ON DATABASE %s FROM PUBLIC",
-					db,
-				)},
-			)
-		}
-		return nil
-	}
-	return errors.New(errUnknownGrant)
-}
-
-func deleteGrantQuery(gp namespacedv1alpha1.GrantParameters, q *xsql.Query) error {
-	gt, err := identifyGrantType(gp)
-	if err != nil {
-		return err
-	}
-
-	ro := pq.QuoteIdentifier(*gp.Role)
-
-	switch gt {
-	case roleMember:
-		q.String = fmt.Sprintf("REVOKE %s FROM %s",
-			pq.QuoteIdentifier(*gp.MemberOf),
+	case v1alpha1.RoleColumn:
+		co := strings.Join(quoteIdentifiers(gp.Columns), ",")
+		cp := columnsPrivileges(gp.Privileges.ToStringSlice(), co)
+		q.String = fmt.Sprintf("REVOKE %s ON TABLE %s FROM %s",
+			cp,
+			strings.Join(prefixAndQuote(*gp.Schema, gp.Tables), ","),
 			ro,
 		)
 		return nil
-	case roleDatabase:
+	case v1alpha1.RoleDatabase:
 		q.String = fmt.Sprintf("REVOKE %s ON DATABASE %s FROM %s",
 			strings.Join(gp.Privileges.ToStringSlice(), ","),
 			pq.QuoteIdentifier(*gp.Database),
 			ro,
 		)
 		return nil
+	case v1alpha1.RoleForeignDataWrapper:
+		q.String = fmt.Sprintf("REVOKE %s ON FOREIGN DATA WRAPPER %s FROM %s",
+			strings.Join(gp.Privileges.ToStringSlice(), ","),
+			strings.Join(quoteIdentifiers(gp.ForeignDataWrappers), ","),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleForeignServer:
+		q.String = fmt.Sprintf("REVOKE %s ON FOREIGN SERVER %s FROM %s",
+			strings.Join(gp.Privileges.ToStringSlice(), ","),
+			strings.Join(quoteIdentifiers(gp.ForeignServers), ","),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleMember:
+		q.String = fmt.Sprintf("REVOKE %s FROM %s",
+			pq.QuoteIdentifier(*gp.MemberOf),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleRoutine:
+		q.String = fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(strings.Join(gp.Privileges.ToStringSlice(), ","), v1alpha1.IsWildcardRoutines(gp.Routines)),
+			grantTarget("ROUTINE", "ROUTINES", *gp.Schema,
+				quotedSignatures(*gp.Schema, gp.Routines), v1alpha1.IsWildcardRoutines(gp.Routines)),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleSchema:
+		q.String = fmt.Sprintf("REVOKE %s ON SCHEMA %s FROM %s",
+			strings.Join(gp.Privileges.ToStringSlice(), ","),
+			pq.QuoteIdentifier(*gp.Schema),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleSequence:
+		q.String = fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(strings.Join(gp.Privileges.ToStringSlice(), ","), v1alpha1.IsWildcard(gp.Sequences)),
+			grantTarget("SEQUENCE", "SEQUENCES", *gp.Schema,
+				prefixAndQuote(*gp.Schema, gp.Sequences), v1alpha1.IsWildcard(gp.Sequences)),
+			ro,
+		)
+		return nil
+	case v1alpha1.RoleTable:
+		q.String = fmt.Sprintf("REVOKE %s ON %s FROM %s",
+			revokedPrivileges(strings.Join(gp.Privileges.ToStringSlice(), ","), v1alpha1.IsWildcard(gp.Tables)),
+			grantTarget("TABLE", "TABLES", *gp.Schema,
+				prefixAndQuote(*gp.Schema, gp.Tables), v1alpha1.IsWildcard(gp.Tables)),
+			ro,
+		)
+		return nil
 	}
-	return errors.New(errUnknownGrant)
+	return errors.Errorf(errUnsupportedGrant, gt)
 }
 
-func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.Grant) (managed.ExternalObservation, error) {
+func (c *external) Disconnect(ctx context.Context) error {
+	return nil
+}
+
+func (c *external) Observe(ctx context.Context, mg *v1alpha1.Grant) (managed.ExternalObservation, error) {
+	if mg == nil {
+		return managed.ExternalObservation{}, errors.New(errNotGrant)
+	}
 	if mg.Spec.ForProvider.Role == nil {
 		return managed.ExternalObservation{}, errors.New(errNoRole)
 	}
 
 	gp := mg.Spec.ForProvider
 	var query xsql.Query
-	if err := selectGrantQuery(gp, &query); err != nil {
+
+	if err := selectGrantQueryWithVersion(gp, &query, c.serverVersion); err != nil {
 		return managed.ExternalObservation{}, err
 	}
 
 	exists := false
 
-	if err := c.db.Scan(ctx, query, &exists); err != nil {
+	if isWildcardGrant(gp) {
+		var matching, total int
+		if err := c.db.Scan(ctx, query, &matching, &total); err != nil {
+			return managed.ExternalObservation{}, errors.Wrap(err, errSelectGrant)
+		}
+		exists = matching == total
+		if mg.GetDeletionTimestamp() != nil {
+			exists = matching > 0
+		}
+	} else if err := c.db.Scan(ctx, query, &exists); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, errSelectGrant)
 	}
 
@@ -327,7 +591,7 @@ func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.Grant) (m
 	}
 
 	// Grants have no way of being 'not up to date' - if they exist, they are up to date
-	mg.SetConditions(xpv1.Available())
+	mg.SetConditions(xpv2.Available())
 
 	return managed.ExternalObservation{
 		ResourceExists:          true,
@@ -336,38 +600,576 @@ func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.Grant) (m
 	}, nil
 }
 
-func (c *external) Create(ctx context.Context, mg *namespacedv1alpha1.Grant) (managed.ExternalCreation, error) {
-	var queries []xsql.Query
-
-	mg.SetConditions(xpv1.Creating())
-
-	if err := createGrantQueries(mg.Spec.ForProvider, &queries); err != nil {
-		return managed.ExternalCreation{}, errors.Wrap(err, errCreateGrant)
-	}
-
-	err := c.db.ExecTx(ctx, queries)
-	return managed.ExternalCreation{}, errors.Wrap(err, errCreateGrant)
+// isWildcardGrant reports whether the grant targets every object of its kind
+// in the schema, which is the only shape whose Observe query returns counts
+// rather than a verdict.
+func isWildcardGrant(gp v1alpha1.GrantParameters) bool {
+	return v1alpha1.IsWildcard(gp.Tables) ||
+		v1alpha1.IsWildcard(gp.Sequences) ||
+		v1alpha1.IsWildcardRoutines(gp.Routines)
 }
 
-func (c *external) Update(ctx context.Context, mg *namespacedv1alpha1.Grant) (managed.ExternalUpdate, error) {
+// grantTarget returns the object phrase of a GRANT/REVOKE statement: the
+// ON ALL <plural> IN SCHEMA form for the wildcard, an object list otherwise.
+func grantTarget(singular, plural, schema string, quoted []string, wildcard bool) string {
+	if wildcard {
+		return fmt.Sprintf("ALL %s IN SCHEMA %s", plural, pq.QuoteIdentifier(schema))
+	}
+	return fmt.Sprintf("%s %s", singular, strings.Join(quoted, ","))
+}
+
+// revokedPrivileges returns what a REVOKE should strip before the GRANT.
+//
+// Revoking only the privileges about to be granted leaves any other privilege
+// in place, so shrinking the set never takes effect and Observe's exact
+// comparison never matches again -- Create then re-runs every poll, writing
+// catalog forever. A wildcard grant already claims the whole schema for the
+// role, so it can revoke everything and rebuild from scratch.
+//
+// The named form deliberately does not: it coexists with column-level grants on
+// the same table, which ALL PRIVILEGES would take with it.
+func revokedPrivileges(granted string, wildcard bool) string {
+	if wildcard {
+		return "ALL PRIVILEGES"
+	}
+	return granted
+}
+
+// prefixAndQuote returns objects in a quoted grantable format, prefixed with the schema
+func prefixAndQuote(sc string, obj []string) []string {
+	qsc := pq.QuoteIdentifier(sc)
+	ret := make([]string, len(obj))
+	for i, v := range obj {
+		ret[i] = qsc + "." + pq.QuoteIdentifier(v)
+	}
+	return ret
+}
+
+// quoteIdentifiers returns a slice of PostgreSQL-quoted identifiers.
+func quoteIdentifiers(items []string) []string {
+	ret := make([]string, len(items))
+	for i, v := range items {
+		ret[i] = pq.QuoteIdentifier(v)
+	}
+	return ret
+}
+
+// quotedSignatures returns routines in a quoted grantable format, prefixed with the schema
+func quotedSignatures(sc string, rs []v1alpha1.Routine) []string {
+	qsc := pq.QuoteIdentifier(sc)
+	sigs := make([]string, len(rs))
+
+	for i, r := range rs {
+		args := make([]string, len(r.Arguments))
+		for j, arg := range r.Arguments {
+			// Type names are emitted lowercased but *unquoted*. Quoting a type
+			// name bypasses PostgreSQL's grammar-level alias resolution: the
+			// parser accepts "int4" (a literal pg_type.typname) but never
+			// "integer", because integer is a grammar keyword mapped to int4.
+			// Observe compares against pg_catalog.format_type(), which emits the
+			// canonical spelling "integer" -- so a quoted type name can never
+			// satisfy both sides. Unquoted, integer/int4/int all resolve and
+			// agree with what Observe reads back.
+			//
+			// Safe because the CRD restricts arguments to a single identifier,
+			// optionally schema-qualified by exactly one more identifier:
+			// +kubebuilder:validation:items:Pattern:=^[a-zA-Z_][a-zA-Z0-9_$]*(\.[a-zA-Z_][a-zA-Z0-9_$]*)?$
+			args[j] = strings.ToLower(arg)
+		}
+		sigs[i] = qsc + "." + pq.QuoteIdentifier(r.Name) + "(" + strings.Join(args, ",") + ")"
+	}
+	return sigs
+}
+
+// resolveGrantType returns the grant type for the given parameters.
+// It checks MemberOfRef/MemberOfSelector first (even if MemberOf is not yet
+// resolved) so the reconciler can identify roleMember grants before ref
+// resolution completes.
+func resolveGrantType(gp v1alpha1.GrantParameters) (v1alpha1.GrantType, error) {
+	// If memberOf is specified via ref or selector, treat as RoleMember even
+	// if the value hasn't been resolved yet.
+	if gp.MemberOfRef != nil || gp.MemberOfSelector != nil || gp.MemberOf != nil {
+		if gp.Database != nil || len(gp.Privileges) > 0 {
+			return "", errors.New(errMemberOfWithDatabaseOrPrivileges)
+		}
+		return v1alpha1.RoleMember, nil
+	}
+
+	if gp.WithInherit != nil {
+		return "", errors.New(errWithInheritOnlyForMemberOf)
+	}
+
+	return gp.IdentifyGrantType()
+}
+
+// routineSignature returns the routine in the same format used by the select query.
+func routineSignature(r v1alpha1.Routine) string {
+	args := make([]string, len(r.Arguments))
+	for i, v := range r.Arguments {
+		args[i] = strings.ToLower(v)
+	}
+	return r.Name + "(" + strings.Join(args, ",") + ")"
+}
+
+func selectColumnGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+
+	// Join grantee. Filter by schema name, table name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	q.String = "SELECT COUNT(*) = $1 AS ct " +
+		"FROM (SELECT 1 FROM pg_class c " +
+		"INNER JOIN pg_namespace n ON c.relnamespace = n.oid " +
+		"INNER JOIN pg_attribute attr on c.oid = attr.attrelid, " +
+		"aclexplode(attr.attacl) as acl " +
+		"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+		// GRANT ... ON TABLE accepts every relkind below, storing the ACL on
+		// that pg_class row, so Observe must read them all back. Filtering to
+		// 'r' alone made grants on views, partitioned tables, materialized
+		// views and foreign tables Create successfully and then never observe.
+		"WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') " +
+		// Filter by table, schema, role and grantable setting
+		"AND n.nspname=$2 " +
+		"AND s.rolname=$3 " +
+		"AND c.relname = ANY($4) " +
+		"AND attr.attname = ANY($5) " +
+		"AND acl.is_grantable=$6 " +
+		"GROUP BY c.relname, n.nspname, s.rolname, attr.attname, acl.is_grantable " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($7::text[]) as perms ORDER BY perms ASC))" +
+		") sub"
+	q.Parameters = []interface{}{
+		len(gp.Tables) * len(gp.Columns),
+		gp.Schema,
+		gp.Role,
+		pq.Array(gp.Tables),
+		pq.Array(gp.Columns),
+		gro,
+		pq.Array(sp),
+	}
+
+	return nil
+}
+
+func selectDatabaseGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+	// Join grantee. Filter by database name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	//
+	// The owner of a database implicitly holds CONNECT, CREATE and TEMPORARY on
+	// it, and PostgreSQL materialises all three into datacl as soon as anything
+	// is granted or revoked. A Grant that asks for a subset -- say only CONNECT
+	// -- would therefore never satisfy an exact set comparison, and Observe
+	// would report the grant as missing forever while Create kept reapplying
+	// it. Compare with containment for the owner, and with equality for every
+	// other grantee, whose privileges the provider fully controls.
+	//
+	q.String = "SELECT EXISTS(SELECT 1 " +
+		"FROM pg_database db, " +
+		"aclexplode(db.datacl) as acl " +
+		"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+		// Filter by database, role and grantable setting
+		"WHERE db.datname=$1 " +
+		"AND s.rolname=$2 " +
+		"AND acl.is_grantable=$3 " +
+		"GROUP BY db.datname, s.rolname, acl.is_grantable, db.datdba, s.oid " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING CASE WHEN db.datdba = s.oid " +
+		"THEN array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
+		"@> (SELECT array(SELECT unnest($4::text[]) as perms ORDER BY perms ASC)) " +
+		"ELSE array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($4::text[]) as perms ORDER BY perms ASC)) " +
+		"END)"
+
+	// The desired state of a revokePublicOnDb grant includes "PUBLIC holds no
+	// privileges on the database", so Observe must check it: the role's own
+	// privileges being present says nothing about whether Create (which issues
+	// the REVOKE ... FROM PUBLIC) ever ran — any unrelated GRANT materialises
+	// datacl with PUBLIC's default CONNECT and TEMPORARY. PUBLIC is grantee 0
+	// in aclexplode(); it is not a pg_roles row.
+	if gp.RevokePublicOnDb != nil && *gp.RevokePublicOnDb {
+		q.String += " AND NOT EXISTS(SELECT 1 " +
+			"FROM pg_database db, " +
+			"aclexplode(db.datacl) as acl " +
+			"WHERE db.datname=$1 " +
+			"AND acl.grantee = 0)"
+	}
+
+	q.Parameters = []interface{}{
+		gp.Database,
+		gp.Role,
+		gro,
+		pq.Array(sp),
+	}
+	return nil
+}
+
+func selectForeignDataWrapperGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+
+	// Join grantee. Filter by schema name, table name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	q.String = "SELECT COUNT(*) >= $1 AS ct " +
+		"FROM (SELECT 1 " +
+		"FROM information_schema.role_usage_grants " +
+		// Filter by column, table, schema, role and grantable setting
+		"WHERE grantee=$2 " +
+		"AND object_type = 'FOREIGN DATA WRAPPER' " +
+		"AND object_name = ANY($3) " +
+		"AND is_grantable=$4 " +
+		"GROUP BY object_name " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING array_agg(TEXT(privilege_type) ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($5::text[]) as perms ORDER BY perms ASC))" +
+		") sub"
+	q.Parameters = []interface{}{
+		len(gp.ForeignDataWrappers),
+		gp.Role,
+		pq.Array(gp.ForeignDataWrappers),
+		yesOrNo(gro),
+		pq.Array(sp),
+	}
+
+	return nil
+}
+
+func selectForeignServerGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+
+	// Join grantee. Filter by schema name, table name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	q.String = "SELECT COUNT(*) >= $1 AS ct " +
+		"FROM (SELECT 1 " +
+		"FROM information_schema.role_usage_grants " +
+		// Filter by column, table, schema, role and grantable setting
+		"WHERE grantee=$2 " +
+		"AND object_type = 'FOREIGN SERVER' " +
+		"AND object_name = ANY($3) " +
+		"AND is_grantable=$4 " +
+		"GROUP BY object_name " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING array_agg(TEXT(privilege_type) ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($5::text[]) as perms ORDER BY perms ASC))" +
+		") sub"
+	q.Parameters = []interface{}{
+		len(gp.ForeignServers),
+		gp.Role,
+		pq.Array(gp.ForeignServers),
+		yesOrNo(gro),
+		pq.Array(sp),
+	}
+
+	return nil
+}
+
+func selectGrantQueryWithVersion(gp v1alpha1.GrantParameters, q *xsql.Query, serverVersion int) error { // nolint: gocyclo
+	gt, err := resolveGrantType(gp)
+	if err != nil {
+		return err
+	}
+
+	switch gt {
+	case v1alpha1.RoleColumn:
+		return selectColumnGrantQuery(gp, q)
+	case v1alpha1.RoleDatabase:
+		return selectDatabaseGrantQuery(gp, q)
+	case v1alpha1.RoleForeignDataWrapper:
+		return selectForeignDataWrapperGrantQuery(gp, q)
+	case v1alpha1.RoleForeignServer:
+		return selectForeignServerGrantQuery(gp, q)
+	case v1alpha1.RoleMember:
+		if gp.WithInherit != nil && serverVersion != versionUnknown && serverVersion < 160000 {
+			return errors.Errorf(errInheritRequiresPG16, serverVersion)
+		}
+		return selectMemberGrantQuery(gp, q)
+	case v1alpha1.RoleRoutine:
+		return selectRoutineGrantQuery(gp, q)
+	case v1alpha1.RoleSchema:
+		return selectSchemaGrantQuery(gp, q)
+	case v1alpha1.RoleSequence:
+		return selectSequenceGrantQuery(gp, q)
+	case v1alpha1.RoleTable:
+		return selectTableGrantQueryWithVersion(gp, q, serverVersion)
+	}
+	return errors.Errorf(errUnsupportedGrant, gt)
+}
+
+func selectMemberGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	ao := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionAdmin
+
+	// Always returns a row with a true or false value.
+	// A simpler query would use ::regrole to cast the roleid and member oids
+	// to their role names, but that throws an error for nonexistent roles
+	// rather than returning false.
+	q.Parameters = []interface{}{
+		gp.Role,
+		gp.MemberOf,
+		ao,
+	}
+
+	if gp.WithInherit != nil {
+		// inherit_option is a pg_auth_members column added in PostgreSQL 16.
+		q.String = "SELECT EXISTS(SELECT 1 FROM pg_auth_members m " +
+			"INNER JOIN pg_roles mo ON m.roleid = mo.oid " +
+			"INNER JOIN pg_roles r ON m.member = r.oid " +
+			"WHERE r.rolname=$1 AND mo.rolname=$2 AND " +
+			"m.admin_option = $3 AND m.inherit_option = $4)"
+		q.Parameters = append(q.Parameters, *gp.WithInherit)
+	} else {
+		q.String = "SELECT EXISTS(SELECT 1 FROM pg_auth_members m " +
+			"INNER JOIN pg_roles mo ON m.roleid = mo.oid " +
+			"INNER JOIN pg_roles r ON m.member = r.oid " +
+			"WHERE r.rolname=$1 AND mo.rolname=$2 AND " +
+			"m.admin_option = $3)"
+	}
+	return nil
+}
+
+func selectRoutineGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+
+	if v1alpha1.IsWildcardRoutines(gp.Routines) {
+		// No signature to compare, so the argument formatting subquery goes
+		// too. pg_proc is counted unfiltered because ON ALL ROUTINES IN SCHEMA
+		// covers functions, aggregates, window functions and procedures alike.
+		q.String = "SELECT COUNT(*) AS matching, (" +
+			"SELECT COUNT(*) FROM pg_proc ap " +
+			"INNER JOIN pg_namespace an ON ap.pronamespace = an.oid " +
+			"WHERE an.nspname=$1" +
+			") AS total " +
+			"FROM (SELECT 1 FROM pg_proc p " +
+			"INNER JOIN pg_namespace n ON p.pronamespace = n.oid, " +
+			"aclexplode(p.proacl) as acl " +
+			"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+			"WHERE n.nspname=$1 " +
+			"AND s.rolname=$2 " +
+			"AND acl.is_grantable=$3 " +
+			"GROUP BY p.oid " +
+			"HAVING array_agg(acl.privilege_type) @> $4::text[] " +
+			"AND array_agg(acl.privilege_type) <@ $4::text[]" +
+			") sub"
+		q.Parameters = []interface{}{
+			gp.Schema,
+			gp.Role,
+			gro,
+			pq.Array(sp),
+		}
+
+		return nil
+	}
+
+	routinesSignatures := make([]string, len(gp.Routines))
+	for i, routine := range gp.Routines {
+		routinesSignatures[i] = routineSignature(routine)
+	}
+
+	// Join grantee. Filter by routine name and signature, schema name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	//
+	// The argument types are formatted in a correlated subquery rather than by
+	// joining unnest(p.proargtypes) into the outer query. Joining would cross
+	// the argument rows with the aclexplode() privilege rows, so
+	// array_agg(acl.privilege_type) would collect one entry per argument and
+	// the HAVING equality below could only ever hold for functions with a
+	// single argument.
+	q.String = "SELECT COUNT(*) = $1 AS ct " +
+		"FROM (SELECT " +
+		// format routine args
+		"p.proname || '(' || coalesce((" +
+		"SELECT array_to_string(array_agg(pg_catalog.format_type(a.t, NULL) ORDER BY a.ord), ',') " +
+		"FROM unnest(p.proargtypes) WITH ORDINALITY AS a(t, ord)" +
+		"), '') || ')' " +
+		"AS signature " +
+		"FROM pg_proc p " +
+		"INNER JOIN pg_namespace n ON p.pronamespace = n.oid, " +
+		"aclexplode(p.proacl) as acl " +
+		"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+		// Filter by sequence, schema, role and grantable setting
+		"WHERE n.nspname=$2 " +
+		"AND s.rolname=$3 " +
+		"AND acl.is_grantable=$4 " +
+		"GROUP BY n.nspname, s.rolname, acl.is_grantable, p.oid, p.proname, p.proargtypes " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($5::text[]) as perms ORDER BY perms ASC))" +
+		") sub " +
+		"WHERE sub.signature = ANY($6)"
+	q.Parameters = []interface{}{
+		len(gp.Routines),
+		gp.Schema,
+		gp.Role,
+		gro,
+		pq.Array(sp),
+		pq.Array(routinesSignatures),
+	}
+
+	return nil
+}
+
+func selectSchemaGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+
+	ep := gp.ExpandPrivileges()
+	sp := ep.ToStringSlice()
+	// Join grantee. Filter by schema name and grantee name.
+	// Finally, perform a permission comparison against expected
+	// permissions.
+	q.String = "SELECT EXISTS(SELECT 1 " +
+		"FROM pg_namespace n, " +
+		"aclexplode(n.nspacl) as acl " +
+		"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+		// Filter by schema, role and grantable setting
+		"WHERE n.nspname=$1 " +
+		"AND s.rolname=$2 " +
+		"AND acl.is_grantable=$3 " +
+		"GROUP BY n.nspname, s.rolname, acl.is_grantable " +
+		// Check privileges match. Convoluted right-hand-side is necessary to
+		// ensure identical sort order of the input permissions.
+		"HAVING array_agg(acl.privilege_type ORDER BY privilege_type ASC) " +
+		"= (SELECT array(SELECT unnest($4::text[]) as perms ORDER BY perms ASC)))"
+	q.Parameters = []interface{}{
+		gp.Schema,
+		gp.Role,
+		gro,
+		pq.Array(sp),
+	}
+	return nil
+}
+
+func selectSequenceGrantQuery(gp v1alpha1.GrantParameters, q *xsql.Query) error {
+	ep := gp.ExpandPrivileges()
+	relationGrantQuery(relkindSequence, gp, gp.Sequences, ep.ToStringSlice(), q)
+	return nil
+}
+
+// relationGrantQuery builds the Observe query for the pg_class-backed grant
+// types, which differ only in the relkind they cover.
+//
+// Parameters are fixed at $1 schema, $2 role, $3 grantable, $4 privileges, and
+// $5 the object names when they are listed explicitly.
+func relationGrantQuery(relkind string, gp v1alpha1.GrantParameters, objects, privileges []string, q *xsql.Query) {
+	gro := gp.WithOption != nil && *gp.WithOption == v1alpha1.GrantOptionGrant
+	params := []interface{}{gp.Schema, gp.Role, gro, pq.Array(privileges)}
+
+	// Counting the schema rather than the request is what converges ON ALL ...
+	// IN SCHEMA, a point-in-time statement in PostgreSQL: an object created
+	// later drops the count below the total, so Create re-runs the GRANT.
+	expected := "(SELECT COUNT(*) FROM pg_class ac " +
+		"INNER JOIN pg_namespace an ON ac.relnamespace = an.oid " +
+		"WHERE ac.relkind " + relkind + " AND an.nspname=$1)"
+	filter := ""
+	if !v1alpha1.IsWildcard(objects) {
+		expected = "cardinality($5::text[])"
+		filter = "AND c.relname = ANY($5) "
+		params = append(params, pq.Array(objects))
+	}
+
+	// Join grantee. Filter by schema, grantee and, unless the wildcard is in
+	// play, object name.
+	cmp := "COUNT(*) = " + expected + " AS ct"
+	if v1alpha1.IsWildcard(objects) {
+		cmp = "COUNT(*) AS matching, " + expected + " AS total"
+	}
+	q.String = "SELECT " + cmp + " " +
+		"FROM (SELECT 1 FROM pg_class c " +
+		"INNER JOIN pg_namespace n ON c.relnamespace = n.oid, " +
+		"aclexplode(c.relacl) as acl " +
+		"INNER JOIN pg_roles s ON acl.grantee = s.oid " +
+		"WHERE c.relkind " + relkind + " " +
+		"AND n.nspname=$1 " +
+		"AND s.rolname=$2 " +
+		filter +
+		"AND acl.is_grantable=$3 " +
+		// Containment both ways is set equality, so neither side needs sorting.
+		// nspname, rolname and is_grantable are pinned by the WHERE, and
+		// pg_class is unique on (relname, relnamespace), so relname groups.
+		"GROUP BY c.relname " +
+		"HAVING array_agg(acl.privilege_type) @> $4::text[] " +
+		"AND array_agg(acl.privilege_type) <@ $4::text[]" +
+		") sub"
+	q.Parameters = params
+}
+
+func selectTableGrantQueryWithVersion(gp v1alpha1.GrantParameters, q *xsql.Query, serverVersion int) error {
+	ep := gp.ExpandPrivilegesWithVersion(serverVersion)
+	relationGrantQuery(relkindTable, gp, gp.Tables, ep.ToStringSlice(), q)
+	return nil
+}
+
+// Setup adds a controller that reconciles Grant managed resources.
+func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
+	name := managed.ControllerName(v1alpha1.GrantGroupKind)
+	t := resource.NewProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{})
+
+	reconcilerOptions := []managed.ReconcilerOption{
+		managed.WithTypedExternalConnector(&connector{kube: mgr.GetClient(), log: o.Logger.WithValues("controller", name), track: t.Track, newDB: postgresql.New}),
+		managed.WithLogger(o.Logger.WithValues("controller", name)),
+		managed.WithPollInterval(o.PollInterval),
+		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+	}
+	if o.Features.Enabled(feature.EnableBetaManagementPolicies) {
+		reconcilerOptions = append(reconcilerOptions, managed.WithManagementPolicies())
+	}
+	r := managed.NewReconciler(mgr,
+		resource.ManagedKind(v1alpha1.GrantGroupVersionKind),
+		reconcilerOptions...,
+	)
+	if err := mgr.Add(statemetrics.NewMRStateRecorder(
+		mgr.GetClient(), o.Logger, o.MetricOptions.MRStateMetrics,
+		&v1alpha1.GrantList{}, o.MetricOptions.PollStateMetricInterval,
+	)); err != nil {
+		return err
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		Named(name).
+		For(&v1alpha1.Grant{}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: maxConcurrency,
+		}).
+		Complete(r)
+}
+
+func (c *external) Update(ctx context.Context, mg *v1alpha1.Grant) (managed.ExternalUpdate, error) {
 	// Update is a no-op, as permissions are fully revoked and then granted in the Create function,
 	// inside a transaction.
 	return managed.ExternalUpdate{}, nil
 }
 
-func (c *external) Disconnect(ctx context.Context) error {
-	return nil
+func withOption(option *v1alpha1.GrantOption) string {
+	if option != nil {
+		return fmt.Sprintf("WITH %s OPTION", string(*option))
+	}
+	return ""
 }
 
-func (c *external) Delete(ctx context.Context, mg *namespacedv1alpha1.Grant) (managed.ExternalDelete, error) {
-	var query xsql.Query
-
-	mg.SetConditions(xpv1.Deleting())
-
-	err := deleteGrantQuery(mg.Spec.ForProvider, &query)
-	if err != nil {
-		return managed.ExternalDelete{}, errors.Wrap(err, errRevokeGrant)
+func yesOrNo(b bool) string {
+	if b {
+		return "YES"
 	}
-
-	return managed.ExternalDelete{}, errors.Wrap(c.db.Exec(ctx, query), errRevokeGrant)
+	return "NO"
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -28,12 +29,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	xpcontroller "github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
 	"github.com/crossplane-contrib/provider-sql/apis/cluster/postgresql/v1alpha1"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients"
@@ -72,6 +73,12 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 		resource.ManagedKind(v1alpha1.ExtensionGroupVersionKind),
 		reconcilerOptions...,
 	)
+	if err := mgr.Add(statemetrics.NewMRStateRecorder(
+		mgr.GetClient(), o.Logger, o.MetricOptions.MRStateMetrics,
+		&v1alpha1.ExtensionList{}, o.MetricOptions.PollStateMetricInterval,
+	)); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		For(&v1alpha1.Extension{}).
@@ -114,13 +121,15 @@ func (c *connector) Connect(ctx context.Context, mg *v1alpha1.Extension) (manage
 		return nil, errors.Wrap(err, errGetSecret)
 	}
 
+	secretData := xsql.RemapCredentialKeys(s.Data, pc.Spec.Credentials.SecretKeyMapping.ToMap())
+
 	// We do not want to create an extension on the default DB
 	// if the user was expecting a database name to be resolved.
 	if mg.Spec.ForProvider.Database != nil {
-		return &external{db: c.newDB(s.Data, *mg.Spec.ForProvider.Database, clients.ToString(pc.Spec.SSLMode))}, nil
+		return &external{db: c.newDB(secretData, *mg.Spec.ForProvider.Database, clients.ToString(pc.Spec.SSLMode))}, nil
 	}
 
-	return &external{db: c.newDB(s.Data, pc.Spec.DefaultDatabase, clients.ToString(pc.Spec.SSLMode))}, nil
+	return &external{db: c.newDB(secretData, pc.Spec.DefaultDatabase, clients.ToString(pc.Spec.SSLMode))}, nil
 }
 
 type external struct{ db xsql.DB }
@@ -154,7 +163,7 @@ func (c *external) Observe(ctx context.Context, mg *v1alpha1.Extension) (managed
 		return managed.ExternalObservation{}, errors.Wrap(err, errSelectExtension)
 	}
 
-	mg.SetConditions(xpv1.Available())
+	mg.SetConditions(xpv2.Available())
 
 	return managed.ExternalObservation{
 		ResourceExists:          true,

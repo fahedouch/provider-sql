@@ -18,21 +18,23 @@ package schema
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	xpcontroller "github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
 	namespacedv1alpha1 "github.com/crossplane-contrib/provider-sql/apis/namespaced/postgresql/v1alpha1"
 	"github.com/crossplane-contrib/provider-sql/pkg/clients"
@@ -72,6 +74,12 @@ func Setup(mgr ctrl.Manager, o xpcontroller.Options) error {
 		resource.ManagedKind(namespacedv1alpha1.SchemaGroupVersionKind),
 		reconcilerOptions...,
 	)
+	if err := mgr.Add(statemetrics.NewMRStateRecorder(
+		mgr.GetClient(), o.Logger, o.MetricOptions.MRStateMetrics,
+		&namespacedv1alpha1.SchemaList{}, o.MetricOptions.PollStateMetricInterval,
+	)); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		For(&namespacedv1alpha1.Schema{}).
@@ -140,7 +148,7 @@ func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.Schema) (
 		return managed.ExternalObservation{}, errors.Wrap(err, errSelectSchema)
 	}
 
-	mg.SetConditions(xpv1.Available())
+	mg.SetConditions(xpv2.Available())
 
 	return managed.ExternalObservation{
 		ResourceExists:          true,
@@ -152,7 +160,7 @@ func (c *external) Observe(ctx context.Context, mg *namespacedv1alpha1.Schema) (
 func (c *external) Create(ctx context.Context, mg *namespacedv1alpha1.Schema) (managed.ExternalCreation, error) { //nolint:gocyclo
 	var queries []xsql.Query
 
-	mg.SetConditions(xpv1.Creating())
+	mg.SetConditions(xpv2.Creating())
 
 	createSchemaQueries(mg.Spec.ForProvider, &queries, meta.GetExternalName(mg))
 
@@ -173,7 +181,11 @@ func (c *external) Update(ctx context.Context, mg *namespacedv1alpha1.Schema) (m
 }
 
 func (c *external) Delete(ctx context.Context, mg *namespacedv1alpha1.Schema) (managed.ExternalDelete, error) {
-	err := c.db.Exec(ctx, xsql.Query{String: "DROP SCHEMA IF EXISTS " + pq.QuoteIdentifier(meta.GetExternalName(mg))})
+	dropBehavior := namespacedv1alpha1.DropBehaviorRestrict
+	if mg.Spec.ForProvider.DropBehavior != nil {
+		dropBehavior = *mg.Spec.ForProvider.DropBehavior
+	}
+	err := c.db.Exec(ctx, xsql.Query{String: fmt.Sprintf("DROP SCHEMA IF EXISTS %s %s", pq.QuoteIdentifier(meta.GetExternalName(mg)), string(dropBehavior))})
 	return managed.ExternalDelete{}, errors.Wrap(err, errDropSchema)
 }
 

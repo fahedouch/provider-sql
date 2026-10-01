@@ -19,8 +19,7 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
-	xpv2 "github.com/crossplane/crossplane-runtime/v2/apis/common/v2"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 )
 
 // A DatabaseSpec defines the desired state of a Database.
@@ -32,7 +31,7 @@ type DatabaseSpec struct {
 
 // A DatabaseStatus represents the observed state of a Database.
 type DatabaseStatus struct {
-	xpv1.ResourceStatus `json:",inline"`
+	xpv2.ManagedResourceStatus `json:",inline"`
 }
 
 // DatabaseParameters define the desired state of a MySQL database instance.
@@ -40,6 +39,16 @@ type DatabaseParameters struct {
 	// BinLog defines whether the create, delete, update operations of this database are propagated to replicas. Defaults to true
 	// +optional
 	BinLog *bool `json:"binlog,omitempty"`
+
+	// DefaultCharacterSet defines the default character set for this database.
+	// See https://dev.mysql.com/doc/refman/8.0/en/charset-database.html
+	// +optional
+	DefaultCharacterSet *string `json:"defaultCharacterSet,omitempty"`
+
+	// DefaultCollation defines the default collation for this database.
+	// See https://dev.mysql.com/doc/refman/8.0/en/charset-database.html
+	// +optional
+	DefaultCollation *string `json:"defaultCollation,omitempty"`
 }
 
 // +kubebuilder:object:root=true

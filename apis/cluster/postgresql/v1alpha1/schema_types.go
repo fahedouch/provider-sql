@@ -19,13 +19,23 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
+)
+
+// DropBehavior sets the method that is used to drop a schema.
+type DropBehavior string
+
+const (
+	// DropBehaviorCascade automatically drops objects contained in the schema.
+	DropBehaviorCascade DropBehavior = "CASCADE"
+	// DropBehaviorRestrict refuses to drop the schema if it contains any objects.
+	DropBehaviorRestrict DropBehavior = "RESTRICT"
 )
 
 // A SchemaSpec defines the desired state of a Schema.
 type SchemaSpec struct {
-	xpv1.ResourceSpec `json:",inline"`
-	ForProvider       SchemaParameters `json:"forProvider"`
+	xpv2.ClusterManagedResourceSpec `json:",inline"`
+	ForProvider                     SchemaParameters `json:"forProvider"`
 }
 
 // SchemaParameters define the desired state of a PostgreSQL schema.
@@ -38,12 +48,12 @@ type SchemaParameters struct {
 	// RoleRef references the role object this schema is for.
 	// +immutable
 	// +optional
-	RoleRef *xpv1.Reference `json:"roleRef,omitempty"`
+	RoleRef *xpv2.Reference `json:"roleRef,omitempty"`
 
 	// RoleSelector selects a reference to a Role this schema is for.
 	// +immutable
 	// +optional
-	RoleSelector *xpv1.Selector `json:"roleSelector,omitempty"`
+	RoleSelector *xpv2.Selector `json:"roleSelector,omitempty"`
 
 	// Database this schema is for.
 	// +optional
@@ -53,21 +63,30 @@ type SchemaParameters struct {
 	// DatabaseRef references the database object this schema is for.
 	// +immutable
 	// +optional
-	DatabaseRef *xpv1.Reference `json:"databaseRef,omitempty"`
+	DatabaseRef *xpv2.Reference `json:"databaseRef,omitempty"`
 
 	// DatabaseSelector selects a reference to a Database this schema is for.
 	// +immutable
 	// +optional
-	DatabaseSelector *xpv1.Selector `json:"databaseSelector,omitempty"`
+	DatabaseSelector *xpv2.Selector `json:"databaseSelector,omitempty"`
 
 	// RevokePublicOnSchema apply a "REVOKE ALL ON SCHEMA public FROM public" statement
 	// +optional
 	RevokePublicOnSchema *bool `json:"revokePublicOnSchema,omitempty" default:"false"`
+
+	// DropBehavior configures deletion behavior: CASCADE will automatically drop
+	// objects (tables, functions, etc.) that are contained in the schema, and in
+	// turn all objects that depend on those objects. The default setting of
+	// RESTRICT will refuse to drop the schema if it contains any objects.
+	// +kubebuilder:validation:Enum=CASCADE;RESTRICT
+	// +kubebuilder:default:=RESTRICT
+	// +optional
+	DropBehavior *DropBehavior `json:"dropBehavior,omitempty"`
 }
 
 // A SchemaStatus represents the observed state of a Schema.
 type SchemaStatus struct {
-	xpv1.ResourceStatus `json:",inline"`
+	xpv2.ManagedResourceStatus `json:",inline"`
 }
 
 // +kubebuilder:object:root=true

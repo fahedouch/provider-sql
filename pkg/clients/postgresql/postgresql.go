@@ -8,15 +8,16 @@ import (
 
 	"github.com/crossplane-contrib/provider-sql/pkg/clients/xsql"
 	"github.com/lib/pq"
+	"github.com/lib/pq/pqerror"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 )
 
 const (
 	// https://www.postgresql.org/docs/current/errcodes-appendix.html
 	// These are not available as part of the pq library.
-	pqInvalidCatalog = pq.ErrorCode("3D000")
+	pqInvalidCatalog = pqerror.Code("3D000")
 )
 
 type postgresDB struct {
@@ -31,11 +32,10 @@ type postgresDB struct {
 // value of PGDATABASE, or if unset, the hardcoded string 'postgres'.
 // The sslmode defines the mode used to set up the connection for the provider.
 func New(creds map[string][]byte, database, sslmode string) xsql.DB {
-	// TODO(negz): Support alternative connection secret formats?
-	endpoint := string(creds[xpv1.ResourceCredentialsSecretEndpointKey])
-	port := string(creds[xpv1.ResourceCredentialsSecretPortKey])
-	username := string(creds[xpv1.ResourceCredentialsSecretUserKey])
-	password := string(creds[xpv1.ResourceCredentialsSecretPasswordKey])
+	endpoint := string(creds[xpv2.CredentialsSecretEndpointKey])
+	port := string(creds[xpv2.CredentialsSecretPortKey])
+	username := string(creds[xpv2.CredentialsSecretUserKey])
+	password := string(creds[xpv2.CredentialsSecretPasswordKey])
 	dsn := DSN(username, password, endpoint, port, database, sslmode)
 
 	return postgresDB{
@@ -131,11 +131,25 @@ func (c postgresDB) Scan(ctx context.Context, q xsql.Query, dest ...interface{})
 // GetConnectionDetails returns the connection details for a user of this DB
 func (c postgresDB) GetConnectionDetails(username, password string) managed.ConnectionDetails {
 	return managed.ConnectionDetails{
-		xpv1.ResourceCredentialsSecretUserKey:     []byte(username),
-		xpv1.ResourceCredentialsSecretPasswordKey: []byte(password),
-		xpv1.ResourceCredentialsSecretEndpointKey: []byte(c.endpoint),
-		xpv1.ResourceCredentialsSecretPortKey:     []byte(c.port),
+		xpv2.CredentialsSecretUserKey:     []byte(username),
+		xpv2.CredentialsSecretPasswordKey: []byte(password),
+		xpv2.CredentialsSecretEndpointKey: []byte(c.endpoint),
+		xpv2.CredentialsSecretPortKey:     []byte(c.port),
 	}
+}
+
+// GetServerVersion returns the PostgreSQL server version as an integer
+// For example, PostgreSQL 16.2 would return 160200.
+func (c postgresDB) GetServerVersion(ctx context.Context) (int, error) {
+	db, err := sql.Open("postgres", c.dsn)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close() //nolint:errcheck
+
+	var version int
+	err = db.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version)
+	return version, err
 }
 
 // IsInvalidCatalog returns true if passed a pq error indicating
